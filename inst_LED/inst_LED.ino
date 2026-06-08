@@ -86,7 +86,7 @@ void loop() {
       updateNoteDisplay(0); // 空のバーを流す
     }
     
-    // 時間を更新（先輩の魔法！）
+    // 時間を更新
     last_shift_time += pixel; 
   }
 }
