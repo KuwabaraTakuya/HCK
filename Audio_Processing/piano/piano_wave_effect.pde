@@ -5,34 +5,38 @@ import processing.serial.*;
 Minim minim;
 AudioOutput out;
 Serial port;
-PianoNote pianoNote; // 設計書に基づき変更
+PianoNote pianoNote;
+
+BitCrusherF bitCrusher;
+LowPassF    lowPass;
+
+float bpm            = 0;
+int   lastNoteOnTime = 0;
 
 void setup() {
-  size(600, 300);
-  background(0);
-  
+  size(900, 560);
+
   minim = new Minim(this);
-  out = minim.getLineOut(Minim.MONO, 512);
-  
+  out   = minim.getLineOut(Minim.MONO, 1024);
+
+  spectrumSetup();
+
+  bitCrusher = new BitCrusherF();
+  lowPass    = new LowPassF();
+
   pianoNote = new PianoNote();
-  out.addSignal(pianoNote); 
-  
+  out.addSignal(pianoNote);
+
   port = new Serial(this, "/dev/cu.usbmodem34B7DA61F2542", 115200);
   port.bufferUntil('\n');
 }
 
 void draw() {
-  background(0);
-  stroke(0, 255, 0); 
-  strokeWeight(2);
-  
-  for (int i = 0; i < out.bufferSize() - 1; i++) {
-    float x1 = map(i, 0, out.bufferSize(), 0, width);
-    float x2 = map(i+1, 0, out.bufferSize(), 0, width);
-    float y1 = 150 + out.mix.get(i) * 150; 
-    float y2 = 150 + out.mix.get(i+1) * 150;
-    line(x1, y1, x2, y2);
-  }
+  background(30, 30, 30);
+  String effLabel = "";
+  if (bitCrusher.active) effLabel += "[BitCrusher] ";
+  if (lowPass.active)    effLabel += "[LowPass]";
+  spectrumDraw("Piano", bpm, effLabel);
 }
 
 void serialEvent(Serial p) {
@@ -47,16 +51,20 @@ void serialEvent(Serial p) {
     int[] data = int(split(msg, ','));
     if (data.length >= 3) {
       if (data[0] > 0) {
-        // 関数名と引数名を設計書に準拠
         pianoNote.noteOn(midiToFreq(data[0]), data[1] / 127.0, data[2]);
+
+        if (lastNoteOnTime > 0) {
+          int interval = millis() - lastNoteOnTime;
+          if (interval > 100 && interval < 3000) bpm = 60000.0 / interval;
+        }
+        lastNoteOnTime = millis();
       } else {
-        pianoNote.noteOff(); //
+        pianoNote.noteOff();
       }
     }
   }
 }
 
-// 設計書の関数名に準拠
 float midiToFreq(int midiNote) {
   return 440.0 * pow(2.0, (midiNote - 69) / 12.0);
 }
@@ -155,8 +163,11 @@ class PianoNote implements AudioSignal {
         }
       }
 
-      // 【ステップC】音量と波形を合成して出力
-      samp[i] = combinedWave * currentVolume;
+      // 【ステップC】音量と波形を合成してエフェクト適用後に出力
+      float sample = combinedWave * currentVolume;
+      sample = bitCrusher.process(sample);
+      sample = lowPass.process(sample);
+      samp[i] = sample;
     }
   }
 
@@ -192,7 +203,41 @@ class PianoNote implements AudioSignal {
   void generate(float[] l, float[] r) { generate(l); }
 }
 
+void keyPressed() {
+  if (key == 'b' || key == 'B') bitCrusher.active = !bitCrusher.active;
+  if (key == 'l' || key == 'L') lowPass.active    = !lowPass.active;
+}
+
 void mousePressed() {
   port.write('S');
   println("Start Signal Sent!");
+}
+
+// ─── ビットクラッシャーエフェクト ───────────────────────────
+// 処理式: y[n] = round(x[n]·2^(B-1)) / 2^(B-1)
+class BitCrusherF {
+  boolean active   = false;
+  int     bitDepth = 4;
+
+  float process(float x) {
+    if (!active) return x;
+    float steps = pow(2, bitDepth - 1);
+    return round(x * steps) / steps;
+  }
+}
+
+// ─── ローパスフィルターエフェクト ───────────────────────────
+// 差分方程式: y[n] = α·x[n] + (1-α)·y[n-1],  α = ωc/(ωc+fs)
+class LowPassF {
+  boolean active   = false;
+  float   cutoffHz = 800;
+  float   prevOut  = 0;
+
+  float process(float x) {
+    if (!active) return x;
+    float wc    = TWO_PI * cutoffHz;
+    float alpha = wc / (wc + out.sampleRate());
+    prevOut = alpha * x + (1 - alpha) * prevOut;
+    return prevOut;
+  }
 }
