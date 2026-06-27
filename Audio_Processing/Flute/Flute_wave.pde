@@ -8,201 +8,254 @@ import ddf.minim.*;
 import ddf.minim.signals.*;
 import processing.serial.*;
 
-Minim       minim;
+Minim minim;
 AudioOutput out;
-Serial      port;
-FluteSig    sig;
+Serial port;
+FluteNote fluteNote;
 
-// エフェクト（本ファイルに保持）
 BitCrusherF bitCrusher;
 LowPassF    lowPass;
 
-// BPM 推定
-float bpm           = 0;
+// 設定フラグ（ピアノと同じ構造）
+boolean harmonicActive = true;
+boolean adsrActive     = true;
+
+float bpm            = 0;
 int   lastNoteOnTime = 0;
 
-// ─────────────────────────────────────────────────────────────
 void setup() {
   size(900, 560);
   minim = new Minim(this);
-  out   = minim.getLineOut(Minim.MONO, 1024); // 1024 で周波数分解能向上
+  out   = minim.getLineOut(Minim.MONO, 1024);
 
-  spectrumSetup(); // SpectrumAnalyzer.pde を初期化
+  spectrumSetup(); // スペクトラムアナライザ初期化
 
   bitCrusher = new BitCrusherF();
   lowPass    = new LowPassF();
+  fluteNote  = new FluteNote();
+  out.addSignal(fluteNote);
 
-  sig = new FluteSig();
-  out.addSignal(sig);
-
-  port = new Serial(this, "/dev/cu.usbmodemF412FA63BC982", 115200);
+  port = new Serial(this, "/dev/cu.usbmodem34B7DA61F2542", 115200);
   port.bufferUntil('\n');
 }
 
 void draw() {
   background(30, 30, 30);
-
-  // エフェクト状態ラベルを作成して spectrumDraw へ渡す
+  
+  // ステータスバー用文字列の生成
   String effLabel = "";
   if (bitCrusher.active) effLabel += "[BitCrusher] ";
-  if (lowPass.active)    effLabel += "[LowPass]";
-
-  spectrumDraw("Flute", bpm, effLabel); // SpectrumAnalyzer.pde
+  if (lowPass.active)    effLabel += "[LowPass] ";
+  if (harmonicActive)    effLabel += "[Harmonics] "; else effLabel += "[PureSine] ";
+  if (adsrActive)        effLabel += "[ADSR] ";      else effLabel += "[Gate] ";
+  
+  spectrumDraw("Flute", bpm, effLabel);
 }
 
-// ─────────────────────────────────────────────────────────────
 void serialEvent(Serial p) {
   String msg = p.readStringUntil('\n');
   if (msg != null) {
     msg = trim(msg);
+    if (msg.equals("RESET")) {
+      fluteNote.reset();
+      spectrumResetPeak(); // ピーク表示もリセット
+      return;
+    }
     int[] data = int(split(msg, ','));
     if (data.length >= 3) {
-      int pitch = data[0];
-      int vel   = data[1];
-      int dur   = data[2];
-
-      if (pitch > 0) {
-        sig.on(m2f(pitch), vel / 127.0, dur);
-
-        // ノートオン間隔から BPM を推定
+      if (data[0] > 0) {
+        fluteNote.noteOn(midiToFreq(data[0]), data[1] / 127.0, data[2]);
         if (lastNoteOnTime > 0) {
           int interval = millis() - lastNoteOnTime;
           if (interval > 100 && interval < 3000) bpm = 60000.0 / interval;
         }
         lastNoteOnTime = millis();
       } else {
-        sig.off();
+        fluteNote.noteOff();
       }
     }
   }
 }
 
-float m2f(int m) {
-  return 440.0 * pow(2.0, (m - 69) / 12.0);
+float midiToFreq(int midiNote) {
+  return 440.0 * pow(2.0, (midiNote - 69) / 12.0);
 }
 
-// B キー: BitCrusher トグル / L キー: LowPass トグル
 void keyPressed() {
   if (key == 'b' || key == 'B') bitCrusher.active = !bitCrusher.active;
   if (key == 'l' || key == 'L') lowPass.active    = !lowPass.active;
+  if (key == 'h' || key == 'H') harmonicActive    = !harmonicActive;
+  if (key == 'e' || key == 'E') adsrActive        = !adsrActive;
 }
 
 void mousePressed() {
   port.write('S');
-  println("Start Signal Sent!");
+  spectrumResetPeak();
 }
 
-// ─── フルート音色シグナルクラス ──────────────────────────────
-// 8倍音合成 + ADSR（設計書 表1・表3 フルートパラメータ）
-class FluteSig implements AudioSignal {
-  float[] harmonicAmps = {1.00, 0.70, 0.50, 0.30, 0.15, 0.08, 0.04, 0.02};
-  float normFactor = 0;
+class HarmonicProfile {
+  int[] targetHarmonics = { 1, 1, 1, 3, 3, 5 };
+  int numHarmonics = targetHarmonics.length;
 
-  float f = 0, a = 0;
-  float[] phases = new float[8];
+  // フルートは基音が強く、高次倍音が少ない丸い音が特徴
+  float getAmplitude(int harmonicNum, float velocity) {
+    if (harmonicNum == 1) return 1.0;
+    if (harmonicNum == 2) return 0.4;
+    if (harmonicNum == 3) return 0.2;
+    return 0.2 / (harmonicNum * harmonicNum); // 4倍音以降は急速に小さくする
+  }
+}
 
-  // ADSR（Attack:30ms / Decay:20ms / Sustain:0.85 / Release:80ms）
-  float attackSec  = 0.030;
-  float decaySec   = 0.020;
-  float sustainLvl = 0.85;
-  float releaseSec = 0.080;
-
-  final int IDLE = 0, ATTACK = 1, DECAY = 2, SUSTAIN = 3, RELEASE = 4;
-  int   adsrState  = IDLE;
-  float envAmp     = 0;
-  float decayRate  = 0, releaseRate = 0;
-
+class FluteNote implements AudioSignal {
+  final int STATE_IDLE    = 0;
+  final int STATE_ATTACK  = 1; 
+  final int STATE_SUSTAIN = 3; 
+  final int STATE_RELEASE = 2; 
+  int currentState = STATE_IDLE;
+  float currentVolume = 0;   
+  
+  // ─── 【改善】ご要望に応じたADSRパラメータの設定 ───
+  float attackSpeed  = 0.0004; // Attack：少しだけ長めに設定（フワッと立ち上がる）
+  float sustainLevel = 0.8;    // Sustain：やや高めに設定（最大音量の80%）
+  float releaseDecay = 0.998;  // Release：少し長めに設定（美しい余韻、ノイズ防止）
+  
+  float frequency, velocity;
+  HarmonicProfile profile;
+  float[] phases;
+  float[] amps;
+  
+  // フルート特有の表現
   float vibratoPhase = 0;
-  float noiseAmp     = 0;
-  int   endTime      = 0;
+  float noiseAmp = 0;
 
-  FluteSig() {
-    for (float h : harmonicAmps) normFactor += h;
+  FluteNote() {
+    profile = new HarmonicProfile();
+    phases = new float[profile.numHarmonics];
+    amps = new float[profile.numHarmonics];
   }
 
-  void on(float freq, float amp, int dur) {
-    f            = freq;
-    a            = amp * 0.5;
-    for (int i = 0; i < 8; i++) phases[i] = 0;
-    adsrState    = ATTACK;
-    envAmp       = 0;
-    noiseAmp     = 0.15;
-    vibratoPhase = 0;
-    endTime      = millis() + dur;
-  }
-
-  void off() { triggerRelease(); }
-
-  void triggerRelease() {
-    if (adsrState != IDLE && adsrState != RELEASE) {
-      releaseRate = max(envAmp, 0.001) / (releaseSec * out.sampleRate());
-      adsrState   = RELEASE;
+  void noteOn(float frequency, float velocity, int duration) {
+    this.frequency = frequency;
+    this.velocity = velocity;
+    
+    if (this.currentState == STATE_IDLE) {
+      this.currentVolume = 0.0;
     }
+
+    
+    this.currentState = STATE_ATTACK;
+    this.vibratoPhase = 0;
+    this.noiseAmp = 0.0; // 息ノイズ（必要に応じて数値を設定してください）
+
+    for (int h = 0; h < profile.numHarmonics; h++) {
+      int hIdx = profile.targetHarmonics[h];
+
+      
+      amps[h] = profile.getAmplitude(hIdx, velocity) * 0.2; // 音割れ防止
+    }
+  }
+
+  void noteOff() {
+    if (currentState != STATE_IDLE) {
+      if (adsrActive) {
+        currentState = STATE_RELEASE;
+      } else {
+        currentState = STATE_IDLE;
+        currentVolume = 0;
+      }
+    }
+  }
+
+  void reset() {
+    currentState = STATE_IDLE;
+    currentVolume = 0;
   }
 
   void generate(float[] samp) {
-    float sr         = out.sampleRate();
-    float attackRate = 1.0 / (attackSec * sr);
-
-    if (millis() >= endTime && adsrState != IDLE && adsrState != RELEASE) {
-      triggerRelease();
-    }
-
     for (int i = 0; i < samp.length; i++) {
-      switch (adsrState) {
-        case ATTACK:
-          envAmp += attackRate;
-          if (envAmp >= 1.0) {
-            envAmp    = 1.0;
-            decayRate = (1.0 - sustainLvl) / (decaySec * sr);
-            adsrState = DECAY;
-          }
-          break;
-        case DECAY:
-          envAmp -= decayRate;
-          if (envAmp <= sustainLvl) { envAmp = sustainLvl; adsrState = SUSTAIN; }
-          break;
-        case SUSTAIN:
-          break;
-        case RELEASE:
-          envAmp -= releaseRate;
-          if (envAmp <= 0) { envAmp = 0; adsrState = IDLE; }
-          break;
-      }
-
-      if (adsrState != IDLE || envAmp > 0) {
-        // 6 Hz ヴィブラート
-        vibratoPhase += TWO_PI * 6.0 / sr;
-        if (vibratoPhase >= TWO_PI) vibratoPhase -= TWO_PI;
-        float currentFreq = f + sin(vibratoPhase) * 2.0;
-
-        // 8倍音正弦波合成: s(t) = (1/normFactor) Σ hk·sin(2π·f0·k·t)
-        float wave = 0;
-        for (int k = 0; k < 8; k++) {
-          wave      += harmonicAmps[k] * sin(phases[k]);
-          phases[k] += TWO_PI * currentFreq * (k + 1) / sr;
-          if (phases[k] >= TWO_PI) phases[k] -= TWO_PI;
+      
+      updateEnvelope();
+      float combinedWave = 0;
+      
+      if (currentState != STATE_IDLE) {
+        
+        // ── ビブラートの計算 ──
+        float currentFreq = frequency;
+        vibratoPhase += TWO_PI * 5.0 / out.sampleRate(); // 約5Hzの揺れ
+        if (vibratoPhase > TWO_PI) vibratoPhase -= TWO_PI;
+        
+        // 安定して吹いている時（Sustain時）にビブラートをかける
+        if (currentState == STATE_SUSTAIN) {
+           currentFreq += sin(vibratoPhase) * 2.5; 
         }
-        wave /= normFactor;
-
-        // アタック時の息ノイズ（徐々に減衰）
+        
+        // ── 倍音合成 ──
+        int loopLimit = harmonicActive ? profile.numHarmonics : 1;
+        for (int h = 0; h < loopLimit; h++) {
+          int hIdx = profile.targetHarmonics[h];
+          combinedWave += sin(phases[h]) * amps[h];
+          
+          phases[h] += TWO_PI * (currentFreq * hIdx) / out.sampleRate();
+          if (phases[h] > TWO_PI) phases[h] -= TWO_PI;
+        }
+        
+        // ── アタック時の息ノイズ（徐々に減衰） ──
         float noise = (random(2.0) - 1.0) * noiseAmp;
-        noiseAmp *= 0.9995;
-
-        float sample = (wave + noise) * a * envAmp;
-        sample = bitCrusher.process(sample); // エフェクト適用
-        sample = lowPass.process(sample);
-        samp[i] = sample;
-      } else {
-        samp[i] = 0;
+        noiseAmp *= 0.9992;
+        combinedWave += noise;
       }
+
+      float sample = combinedWave * currentVolume;
+      sample = bitCrusher.process(sample);
+      sample = lowPass.process(sample);
+      samp[i] = sample;
     }
   }
+
+  void updateEnvelope() {
+    if (!adsrActive) {
+      if (currentState == STATE_SUSTAIN || currentState == STATE_ATTACK) {
+        currentVolume = 1.0;
+        currentState = STATE_SUSTAIN;
+      } else {
+        currentVolume = 0;
+      }
+      return;
+    }
+
+    switch (currentState) {
+      case STATE_ATTACK:
+        // sustainLevel（0.8）に向かって、少し長めの時間をかけて立ち上げる
+        currentVolume += attackSpeed;
+        if (currentVolume >= sustainLevel) {
+          currentVolume = sustainLevel;
+          currentState = STATE_SUSTAIN; // Decayを挟まず直接Sustainへ（Decay: ゼロ）
+        }
+        break;
+
+      case STATE_SUSTAIN:
+        // やや高めに設定した音量をそのまま100%キープ
+        currentVolume = sustainLevel;
+        break;
+
+      case STATE_RELEASE:
+        // 少し長めの設定（0.998）で、フワッと滑らかに音を消していく
+        currentVolume *= releaseDecay;
+        if (currentVolume < 0.001) {
+          currentVolume = 0;
+          currentState = STATE_IDLE;
+        }
+        break;
+
+      case STATE_IDLE:
+        currentVolume = 0;
+        break;
+    }
+  }
+
   void generate(float[] l, float[] r) { generate(l); }
 }
 
-// ─── ビットクラッシャーエフェクト ───────────────────────────
-// 処理式: y[n] = round(x[n]·2^(B-1)) / 2^(B-1)
 class BitCrusherF {
   boolean active   = false;
   int     bitDepth = 4;
@@ -214,8 +267,6 @@ class BitCrusherF {
   }
 }
 
-// ─── ローパスフィルターエフェクト ───────────────────────────
-// 差分方程式: y[n] = α·x[n] + (1-α)·y[n-1],  α = ωc/(ωc+fs)
 class LowPassF {
   boolean active   = false;
   float   cutoffHz = 800;
